@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# nosleep — keep this Mac awake, even with the lid closed (clamshell mode).
+#
+#   nosleep on [DURATION]   Disable sleep (survives closing the lid), auto-off later
+#   nosleep off             Restore normal sleep behavior now
+#   nosleep status          Show current state and time remaining
+#
+# DURATION defaults to 3h. Accepts 3h, 90m, 45s, or a bare number (= hours).
+#
+# "on" uses `sudo pmset -a disablesleep 1`, the switch that keeps the machine
+# awake even with the lid shut, and also runs `caffeinate` so the display/disk
+# don't idle. A background timer (running as root, so it needs no second
+# password) flips sleep back on after DURATION as a guardrail. "off" reverses
+# everything immediately. Note: macOS resets disablesleep to 0 on reboot.
+#
+set -euo pipefail
+
+STATE_DIR="$HOME/.local/state/nosleep"
+CAFFEINATE_PIDFILE="$STATE_DIR/caffeinate.pid"
+TIMER_PIDFILE="$STATE_DIR/timer.pid"
+OFF_AT_FILE="$STATE_DIR/off_at"
+
+mkdir -p "$STATE_DIR"
+
+log() { printf '%s\n' "$*"; }
+
+# Parse a duration into seconds. Accepts Nh, Nm, Ns, or bare N (hours).
+parse_duration() {
+  local d="$1" n unit
+  if [[ "$d" =~ ^([0-9]+)([hHmMsS]?)$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]:-h}"
+  else
+    return 1
+  fi
+  case "$unit" in
+    h|H) echo $((n * 3600)) ;;
+    m|M) echo $((n * 60)) ;;
+    s|S) echo "$n" ;;
+  esac
+  [[ "$n" -gt 0 ]] || return 1
+}
+
+start_caffeinate() {
+  local secs="$1"
+  # -d display, -i idle system, -m disk, -s system (AC), -u assert user active
+  # -t bounds it to the same window; nohup so it outlives this shell / terminal.
+  nohup caffeinate -dimsu -t "$secs" >/dev/null 2>&1 </dev/null &
+  echo $! > "$CAFFEINATE_PIDFILE"
+}
+
+stop_caffeinate() {
+  if [[ -f "$CAFFEINATE_PIDFILE" ]] && kill -0 "$(cat "$CAFFEINATE_PIDFILE")" 2>/dev/null; then
+    kill "$(cat "$CAFFEINATE_PIDFILE")" 2>/dev/null || true
+  fi
+  rm -f "$CAFFEINATE_PIDFILE"
+  pkill -f 'caffeinate -dimsu' 2>/dev/null || true
+}
+
+caffeinate_running() {
+  if [[ -f "$CAFFEINATE_PIDFILE" ]] && kill -0 "$(cat "$CAFFEINATE_PIDFILE")" 2>/dev/null; then
+    return 0
+  fi
+  pgrep -f 'caffeinate -dimsu' >/dev/null 2>&1
+}
+
+cmd_on() {
+  local dur="${1:-3h}" secs off_at_human
+  if ! secs="$(parse_duration "$dur")"; then
+    log "Invalid duration: '$dur' (use 3h, 90m, 45s, or a bare number of hours)"
+    exit 1
+  fi
+  off_at_human="$(date -v+"${secs}"S '+%I:%M %p')"
+
+  log "Disabling sleep for $dur (lid-close included). You'll be asked for your password."
+  # One sudo call: cancel any prior timer, disable sleep, arm a root-owned timer
+  # that re-enables sleep after DURATION without needing a second password.
+  sudo bash -c "
+    if [ -f '$TIMER_PIDFILE' ]; then kill \$(cat '$TIMER_PIDFILE') 2>/dev/null || true; fi
+    pmset -a disablesleep 1
+    nohup bash -c 'sleep $secs; pmset -a disablesleep 0; rm -f \"$TIMER_PIDFILE\" \"$OFF_AT_FILE\"' >/dev/null 2>&1 </dev/null &
+    echo \$! > '$TIMER_PIDFILE'
+  "
+
+  stop_caffeinate
+  start_caffeinate "$secs"
+  echo "$(( $(date +%s) + secs ))" > "$OFF_AT_FILE"
+
+  log "✅  Sleep disabled. Lid can stay closed. Auto-off at $off_at_human (or run 'nosleep off')."
+}
+
+cmd_off() {
+  log "Restoring normal sleep behavior. You'll be asked for your password."
+  sudo bash -c "
+    if [ -f '$TIMER_PIDFILE' ]; then kill \$(cat '$TIMER_PIDFILE') 2>/dev/null || true; rm -f '$TIMER_PIDFILE'; fi
+    pmset -a disablesleep 0
+  "
+  stop_caffeinate
+  rm -f "$OFF_AT_FILE"
+  log "✅  Sleep restored to normal."
+}
+
+cmd_status() {
+  local ds
+  ds="$(pmset -g | awk '/disablesleep/ {print $2}')"
+  ds="${ds:-0}"
+  if [[ "$ds" == "1" ]]; then
+    log "disablesleep : ON  (Mac will not sleep, even with the lid closed)"
+  else
+    log "disablesleep : off (normal sleep behavior)"
+  fi
+
+  if caffeinate_running; then
+    log "caffeinate   : running"
+  else
+    log "caffeinate   : not running"
+  fi
+
+  if [[ -f "$OFF_AT_FILE" ]]; then
+    local off_at now rem
+    off_at="$(cat "$OFF_AT_FILE")"
+    now="$(date +%s)"
+    rem=$((off_at - now))
+    if [[ "$rem" -gt 0 ]]; then
+      printf 'auto-off in  : %dh %02dm (at %s)\n' \
+        $((rem / 3600)) $(((rem % 3600) / 60)) "$(date -r "$off_at" '+%I:%M %p')"
+    fi
+  fi
+}
+
+case "${1:-}" in
+  on)     cmd_on "${2:-}" ;;
+  off)    cmd_off ;;
+  status) cmd_status ;;
+  *)
+    cat >&2 <<'USAGE'
+Usage: nosleep <on [DURATION] | off | status>
+
+  on [DURATION]   Disable sleep (survives lid close), auto-off after DURATION
+                  DURATION defaults to 3h. Accepts 3h, 90m, 45s, or bare hours.
+  off             Restore normal sleep behavior now
+  status          Show current state and time remaining
+USAGE
+    exit 1
+    ;;
+esac
