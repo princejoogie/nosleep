@@ -103,7 +103,9 @@ cmd_off() {
 
 cmd_status() {
   local ds
-  ds="$(pmset -g | awk '/disablesleep/ {print $2}')"
+  # pmset reports this as "SleepDisabled" in `pmset -g`, even though it's set
+  # via `pmset -a disablesleep`. Match either name, case-insensitively.
+  ds="$(pmset -g | awk 'tolower($0) ~ /sleepdisabled|disablesleep/ {print $2; exit}')"
   ds="${ds:-0}"
   if [[ "$ds" == "1" ]]; then
     log "disablesleep : ON  (Mac will not sleep, even with the lid closed)"
