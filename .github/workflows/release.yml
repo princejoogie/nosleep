@@ -62,6 +62,7 @@ jobs:
           publish: bun run release
           version: bun run version-packages
           title: ${{ steps.release-title.outputs.title }}
+          commit: ${{ steps.release-title.outputs.title }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
