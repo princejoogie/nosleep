@@ -1,6 +1,6 @@
 {
   "name": "nosleep-cli",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Keep your Mac awake with the lid closed, with an auto-off guardrail",
   "scripts": {
     "changeset": "changeset",
