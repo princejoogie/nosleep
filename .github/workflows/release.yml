@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version to publish to Homebrew (for example, 1.2.3)
+        required: true
+        type: string
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -14,6 +20,7 @@ permissions:
 
 jobs:
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -25,17 +32,39 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.14"
+
       - name: Update npm
         run: npm install --global npm@11.5.2
       - run: bun install --frozen-lockfile
+
+      # Changesets Action accepts a custom title but does not interpolate the
+      # next version. Derive it from the release plan; on the publish run there
+      # are no pending changesets, so fall back to package.json.
+      - name: Determine release pull request title
+        id: release-title
+        shell: bash
+        run: |
+          set -euo pipefail
+          status_file="$RUNNER_TEMP/changeset-status.json"
+          bun run changeset status --output "$status_file"
+          version="$(node -e '
+            const fs = require("node:fs");
+            const status = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const pkg = require("./package.json");
+            process.stdout.write(status.releases[0]?.newVersion ?? pkg.version);
+          ' "$status_file")"
+          echo "title=release: v$version" >> "$GITHUB_OUTPUT"
+
       - name: Create release pull request or publish
         id: changesets
         uses: changesets/action@v1
         with:
           publish: bun run release
           version: bun run version-packages
+          title: ${{ steps.release-title.outputs.title }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and upload GitHub release archive
         if: steps.changesets.outputs.published == 'true'
         env:
@@ -66,65 +95,52 @@ jobs:
               --generate-notes \
               --title "nosleep $version"
           fi
-      - name: Build Homebrew formula
-        if: steps.changesets.outputs.published == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(node -p 'require("./package.json").version')"
-          tag="v$version"
-          archive="nosleep-$version.tar.gz"
-          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag/$archive"
-
-          sha256="$(sha256sum "$archive" | awk '{print $1}')"
-
-          cat > nosleep.rb <<FORMULA
-          class Nosleep < Formula
-            desc "Keep your Mac awake with the lid closed"
-            homepage "https://github.com/${GITHUB_REPOSITORY}"
-            url "$url"
-            version "$version"
-            sha256 "$sha256"
-            license "MIT"
-            head "https://github.com/${GITHUB_REPOSITORY}.git", branch: "main"
-
-            depends_on :macos
-
-            def install
-              bin.install "nosleep"
-            end
-
-            test do
-              assert_match "Usage: nosleep", shell_output("#{bin}/nosleep --help")
-            end
-          end
-          FORMULA
-
-          ruby -c nosleep.rb
       - uses: actions/checkout@v6
         if: steps.changesets.outputs.published == 'true'
         with:
           repository: omsimos/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
+
       - name: Publish Homebrew formula
         if: steps.changesets.outputs.published == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p homebrew-tap/Formula
-          cp nosleep.rb homebrew-tap/Formula/nosleep.rb
+          version="$(node -p 'require("./package.json").version')"
+          scripts/publish-homebrew.sh "$version" "nosleep-$version.tar.gz" homebrew-tap
 
-          cd homebrew-tap
-          git add Formula/nosleep.rb
-          if git diff --cached --quiet; then
-            echo "Formula is already up to date"
-            exit 0
+  recover-homebrew:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: omsimos/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Publish existing release to Homebrew
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_INPUT: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${VERSION_INPUT#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: $VERSION_INPUT" >&2
+            exit 1
           fi
 
-          version="$(node -p 'require("../package.json").version')"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Update nosleep to $version"
-          git pull --rebase
-          git push
+          tag="v$version"
+          archive="nosleep-$version.tar.gz"
+          archive_path="$RUNNER_TEMP/$archive"
+
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$archive" \
+            --dir "$RUNNER_TEMP"
+          scripts/publish-homebrew.sh "$version" "$archive_path" homebrew-tap
