@@ -9,10 +9,12 @@
   },
   "packageManager": "bun@1.3.14",
   "bin": {
-    "nosleep": "nosleep"
+    "nosleep": "nosleep",
+    "nosleep-brightness": "nosleep-brightness"
   },
   "files": [
     "nosleep",
+    "nosleep-brightness",
     "README.md",
     "LICENSE"
   ],

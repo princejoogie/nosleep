@@ -45,11 +45,12 @@ class Nosleep < Formula
   depends_on :macos
 
   def install
-    bin.install "nosleep"
+    bin.install "nosleep", "nosleep-brightness"
   end
 
   test do
     assert_match "Usage: nosleep", shell_output("#{bin}/nosleep --help")
+    assert_match "Usage: nosleep-brightness", shell_output("#{bin}/nosleep-brightness --help")
   end
 end
 FORMULA

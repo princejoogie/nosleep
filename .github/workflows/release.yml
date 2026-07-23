@@ -83,7 +83,7 @@ jobs:
             --group=0 \
             --numeric-owner \
             -czf "$archive" \
-            nosleep README.md LICENSE
+            nosleep nosleep-brightness README.md LICENSE
           sha256sum "$archive" > "$archive.sha256"
 
           if gh release view "$tag" >/dev/null 2>&1; then
