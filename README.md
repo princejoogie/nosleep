@@ -8,6 +8,20 @@ A tiny macOS CLI that keeps your Mac awake with the lid closed (clamshell mode) 
 
 ## Install
 
+With npm:
+
+```sh
+npm install -g nosleep-cli
+```
+
+With Homebrew:
+
+```sh
+brew install omsimos/tap/nosleep
+```
+
+Or from source:
+
 ```sh
 xcode-select --install
 git clone https://github.com/omsimos/nosleep.git

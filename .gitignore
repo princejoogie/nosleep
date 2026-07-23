@@ -4,3 +4,6 @@
 # Editor cruft
 *.swp
 *~
+
+# Node tooling (Changesets only)
+node_modules/
