@@ -34,7 +34,6 @@ nosleep on 90m      # custom window — accepts 3h, 90m, 45s, or a bare number (
 nosleep off         # restore normal sleep immediately
 nosleep status      # show current state and time remaining
 nosleep --help      # usage
-nosleep --version   # version
 ```
 
 `on` and `off` run `sudo pmset` and may prompt for your password. `status` is read-only and needs no password. Running `on` again while already active just refreshes the window with the new duration.

@@ -6,7 +6,6 @@
 #   nosleep off             Restore normal sleep behavior now
 #   nosleep status          Show current state and time remaining
 #   nosleep --help          Show usage
-#   nosleep --version       Show version
 #
 # DURATION defaults to 3h. Accepts 3h, 90m, 45s, or a bare number (= hours).
 #
@@ -18,16 +17,11 @@
 #
 set -euo pipefail
 
-readonly VERSION="0.2.0"
 readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nosleep"
 readonly CAFFEINATE_PIDFILE="$STATE_DIR/caffeinate.pid"
 readonly TIMER_PIDFILE="$STATE_DIR/timer.pid"
 readonly OFF_AT_FILE="$STATE_DIR/off_at"
 readonly DEFAULT_DURATION="3h"
-
-# Shared by the sudo calls in cmd_on/cmd_off: kill a pending auto-off timer
-# (if any) and drop its pidfile. Expanded here, executed later as root.
-readonly CANCEL_TIMER="if [ -f '$TIMER_PIDFILE' ]; then kill \$(cat '$TIMER_PIDFILE') 2>/dev/null || true; rm -f '$TIMER_PIDFILE'; fi"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'nosleep: %s\n' "$*" >&2; exit 1; }
@@ -42,14 +36,17 @@ Usage: nosleep <on [DURATION] | off | status>
   status          Show current state and time remaining
 
   -h, --help      Show this help
-  -v, --version   Show version
 USAGE
 }
 
 # macOS-only (pmset and caffeinate ship with it). Also make sure the state
 # directory exists before any command touches it.
 preflight() {
-  [[ "$OSTYPE" == darwin* ]] || die "only works on macOS (needs pmset and caffeinate)."
+  [[ "$(uname -s)" == "Darwin" ]] || die "only works on macOS (needs pmset and caffeinate)."
+  local cmd
+  for cmd in pmset caffeinate; do
+    command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
+  done
   mkdir -p "$STATE_DIR"
 }
 
@@ -71,9 +68,37 @@ parse_duration() {
 # against a recycled PID pointing at something unrelated).
 is_our_caffeinate() {
   local pid="$1"
-  [[ -n "$pid" ]] || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   [[ "$(ps -p "$pid" -o comm= 2>/dev/null)" == *caffeinate ]]
+}
+
+# True if the given PID is live and actually our root-owned auto-off timer.
+# The pidfile lives in a user-writable dir, so validate before ever handing a
+# value to the root shell: reject non-numeric junk, then confirm the process
+# command line is the timer we armed (guards against a recycled/stale PID).
+# No `kill -0` here: the timer is root-owned, so signalling it from the user
+# would fail with EPERM even while it's alive. `ps` sees it regardless of
+# ownership, so the command-line match confirms both existence and identity.
+is_our_timer() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *"pmset -a disablesleep 0"* ]]
+}
+
+# Emit the root-shell snippet that cancels a pending auto-off timer, run inside
+# the sudo bash -c strings in cmd_on/cmd_off. The PID is read and validated
+# here (user-side) so only a known-good numeric PID can reach `kill` as root;
+# anything else drops the pidfile without killing. A small check-then-kill race
+# remains (same class as the caffeinate path) — acceptable.
+cancel_timer_snippet() {
+  local pid
+  pid="$(cat "$TIMER_PIDFILE" 2>/dev/null || true)"
+  if is_our_timer "$pid"; then
+    printf "kill %s 2>/dev/null || true; rm -f '%s'" "$pid" "$TIMER_PIDFILE"
+  else
+    printf "rm -f '%s'" "$TIMER_PIDFILE"
+  fi
 }
 
 start_caffeinate() {
@@ -85,8 +110,12 @@ start_caffeinate() {
 }
 
 stop_caffeinate() {
-  if caffeinate_running; then
-    kill "$(cat "$CAFFEINATE_PIDFILE")" 2>/dev/null || true
+  # Read the pidfile once and kill exactly the value we validated — a second
+  # read could be rewritten by a concurrent `nosleep on` (TOCTOU).
+  local pid
+  pid="$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
+  if is_our_caffeinate "$pid"; then
+    kill "$pid" 2>/dev/null || true
   fi
   rm -f "$CAFFEINATE_PIDFILE"
 }
@@ -102,11 +131,11 @@ cmd_on() {
   fi
   off_at_human="$(date -v"+${secs}S" '+%I:%M %p')"
 
-  log "Disabling sleep for $dur (lid-close included). This runs 'sudo pmset' and may prompt for your password."
+  log "Disabling sleep for $dur."
   # One sudo call: cancel any prior timer, disable sleep, arm a root-owned timer
   # that re-enables sleep after DURATION without needing a second password.
   sudo bash -c "
-    $CANCEL_TIMER
+    $(cancel_timer_snippet)
     pmset -a disablesleep 1
     nohup bash -c 'sleep $secs; pmset -a disablesleep 0; rm -f \"$TIMER_PIDFILE\" \"$OFF_AT_FILE\"' >/dev/null 2>&1 </dev/null &
     echo \$! > '$TIMER_PIDFILE'
@@ -116,18 +145,18 @@ cmd_on() {
   start_caffeinate "$secs"
   echo "$(( $(date +%s) + secs ))" > "$OFF_AT_FILE"
 
-  log "✅  Sleep disabled. Lid can stay closed. Auto-off at $off_at_human (or run 'nosleep off')."
+  log "Sleep disabled. Auto-off at $off_at_human (or run 'nosleep off')."
 }
 
 cmd_off() {
-  log "Restoring normal sleep behavior. This runs 'sudo pmset' and may prompt for your password."
+  log "Restoring normal sleep behavior."
   sudo bash -c "
-    $CANCEL_TIMER
+    $(cancel_timer_snippet)
     pmset -a disablesleep 0
   "
   stop_caffeinate
   rm -f "$OFF_AT_FILE"
-  log "✅  Sleep restored to normal."
+  log "Sleep restored to normal."
 }
 
 cmd_status() {
@@ -153,7 +182,7 @@ cmd_status() {
     log "caffeinate   : not running"
   fi
 
-  if [[ -f "$OFF_AT_FILE" ]]; then
+  if [[ "$ds" == "1" && -f "$OFF_AT_FILE" ]]; then
     local off_at now rem
     off_at="$(cat "$OFF_AT_FILE")"
     now="$(date +%s)"
@@ -170,6 +199,5 @@ case "${1:-}" in
   off)                  preflight; cmd_off ;;
   status)               preflight; cmd_status ;;
   -h|--help|help)       usage ;;
-  -v|--version|version) log "nosleep $VERSION" ;;
   *)                    usage >&2; exit 1 ;;
 esac
