@@ -4,7 +4,14 @@
 
 A tiny macOS CLI that keeps your Mac awake with the lid closed (clamshell mode) — so long tasks like agent runs, builds, or downloads keep going — while switching off the hidden display backlight and retaining a built-in auto-off guardrail.
 
-`caffeinate` alone won't do this: on battery a Mac still sleeps once you close the lid. The switch that actually enables clamshell-without-external-display is `sudo pmset -a disablesleep 1`. `nosleep` wraps that, runs `caffeinate` so the display and disk don't idle, dims the built-in display to zero while the lid is closed, and arms a timer that restores normal sleep after a set duration (default 3h) so you can't leave it on forever.
+## Why?
+
+`nosleep` solves **4 problems** that are easy to miss when coding with laptops closed.
+
+- ☕ **Idle-time.** Solved w/ `caffeinate` so it doesn't sleep when the lid is open, but still sleeps when it's closed. (most people stop here)
+- 💤 **Closed-Lid.** The switch that actually enables clamshell-without-external-display is `sudo pmset -a disablesleep 1`.
+- 🔥 **Heat.** We dim the display to stop the heat and keyboard from trapping heat in a closed area.
+- ⌛ **Set and forget.** set it and never think about restoring it again it automatically restores normal sleep after a 3hr configurable duration by default.
 
 ## Install
 
