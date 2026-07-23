@@ -3,7 +3,9 @@ name: shellcheck
 on:
   push:
     branches: [main]
+    paths: [nosleep, .github/workflows/shellcheck.yml]
   pull_request:
+    paths: [nosleep, .github/workflows/shellcheck.yml]
 
 jobs:
   shellcheck:

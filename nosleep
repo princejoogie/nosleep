@@ -25,15 +25,19 @@ readonly TIMER_PIDFILE="$STATE_DIR/timer.pid"
 readonly OFF_AT_FILE="$STATE_DIR/off_at"
 readonly DEFAULT_DURATION="3h"
 
+# Shared by the sudo calls in cmd_on/cmd_off: kill a pending auto-off timer
+# (if any) and drop its pidfile. Expanded here, executed later as root.
+readonly CANCEL_TIMER="if [ -f '$TIMER_PIDFILE' ]; then kill \$(cat '$TIMER_PIDFILE') 2>/dev/null || true; rm -f '$TIMER_PIDFILE'; fi"
+
 log() { printf '%s\n' "$*"; }
 die() { printf 'nosleep: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  cat <<'USAGE'
+  cat <<USAGE
 Usage: nosleep <on [DURATION] | off | status>
 
   on [DURATION]   Disable sleep (survives lid close), auto-off after DURATION
-                  DURATION defaults to 3h. Accepts 3h, 90m, 45s, or bare hours.
+                  DURATION defaults to $DEFAULT_DURATION. Accepts 3h, 90m, 45s, or bare hours.
   off             Restore normal sleep behavior now
   status          Show current state and time remaining
 
@@ -42,14 +46,10 @@ Usage: nosleep <on [DURATION] | off | status>
 USAGE
 }
 
-# macOS-only, and pmset/caffeinate must be present. Also make sure the state
+# macOS-only (pmset and caffeinate ship with it). Also make sure the state
 # directory exists before any command touches it.
 preflight() {
-  [[ "$(uname -s)" == "Darwin" ]] || die "only works on macOS (needs pmset and caffeinate)."
-  local cmd
-  for cmd in pmset caffeinate; do
-    command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
-  done
+  [[ "$OSTYPE" == darwin* ]] || die "only works on macOS (needs pmset and caffeinate)."
   mkdir -p "$STATE_DIR"
 }
 
@@ -85,21 +85,14 @@ start_caffeinate() {
 }
 
 stop_caffeinate() {
-  local pid
-  if [[ -f "$CAFFEINATE_PIDFILE" ]]; then
-    pid="$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
-    if is_our_caffeinate "$pid"; then
-      kill "$pid" 2>/dev/null || true
-    fi
-    rm -f "$CAFFEINATE_PIDFILE"
+  if caffeinate_running; then
+    kill "$(cat "$CAFFEINATE_PIDFILE")" 2>/dev/null || true
   fi
+  rm -f "$CAFFEINATE_PIDFILE"
 }
 
 caffeinate_running() {
-  local pid
-  [[ -f "$CAFFEINATE_PIDFILE" ]] || return 1
-  pid="$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
-  is_our_caffeinate "$pid"
+  is_our_caffeinate "$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
 }
 
 cmd_on() {
@@ -113,7 +106,7 @@ cmd_on() {
   # One sudo call: cancel any prior timer, disable sleep, arm a root-owned timer
   # that re-enables sleep after DURATION without needing a second password.
   sudo bash -c "
-    if [ -f '$TIMER_PIDFILE' ]; then kill \$(cat '$TIMER_PIDFILE') 2>/dev/null || true; fi
+    $CANCEL_TIMER
     pmset -a disablesleep 1
     nohup bash -c 'sleep $secs; pmset -a disablesleep 0; rm -f \"$TIMER_PIDFILE\" \"$OFF_AT_FILE\"' >/dev/null 2>&1 </dev/null &
     echo \$! > '$TIMER_PIDFILE'
@@ -129,7 +122,7 @@ cmd_on() {
 cmd_off() {
   log "Restoring normal sleep behavior. This runs 'sudo pmset' and may prompt for your password."
   sudo bash -c "
-    if [ -f '$TIMER_PIDFILE' ]; then kill \$(cat '$TIMER_PIDFILE') 2>/dev/null || true; rm -f '$TIMER_PIDFILE'; fi
+    $CANCEL_TIMER
     pmset -a disablesleep 0
   "
   stop_caffeinate
@@ -144,16 +137,13 @@ cmd_status() {
   ds="$(pmset -g | awk 'tolower($0) ~ /sleepdisabled|disablesleep/ {print $2; exit}')"
   ds="${ds:-0}"
 
-  # If sleep isn't disabled, any leftover timer/off_at state is stale — e.g.
-  # after a reboot, which resets disablesleep but leaves these files behind.
-  # Clean it up so we never report a phantom auto-off.
-  if [[ "$ds" != "1" ]]; then
-    rm -f "$OFF_AT_FILE" "$TIMER_PIDFILE"
-  fi
-
   if [[ "$ds" == "1" ]]; then
     log "disablesleep : ON  (Mac will not sleep, even with the lid closed)"
   else
+    # Any leftover timer/off_at state is stale — e.g. after a reboot, which
+    # resets disablesleep but leaves these files behind. Clean it up so we
+    # never report a phantom auto-off below.
+    rm -f "$OFF_AT_FILE" "$TIMER_PIDFILE"
     log "disablesleep : off (normal sleep behavior)"
   fi
 
@@ -163,7 +153,7 @@ cmd_status() {
     log "caffeinate   : not running"
   fi
 
-  if [[ "$ds" == "1" && -f "$OFF_AT_FILE" ]]; then
+  if [[ -f "$OFF_AT_FILE" ]]; then
     local off_at now rem
     off_at="$(cat "$OFF_AT_FILE")"
     now="$(date +%s)"
