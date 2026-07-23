@@ -10,17 +10,25 @@
 # DURATION defaults to 3h. Accepts 3h, 90m, 45s, or a bare number (= hours).
 #
 # "on" uses `sudo pmset -a disablesleep 1`, the switch that keeps the machine
-# awake even with the lid shut, and also runs `caffeinate` so the display/disk
-# don't idle. A background timer (running as root, so it needs no second
-# password) flips sleep back on after DURATION as a guardrail. "off" reverses
-# everything immediately. Note: macOS resets disablesleep to 0 on reboot.
+# awake even with the lid shut, runs `caffeinate`, and dims the built-in display
+# while the lid is closed. A background timer (running as root, so it needs no
+# second password) flips sleep back on after DURATION as a guardrail. "off"
+# reverses everything immediately. Note: macOS resets disablesleep on reboot.
 #
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR SCRIPT_PATH
 readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nosleep"
 readonly CAFFEINATE_PIDFILE="$STATE_DIR/caffeinate.pid"
+readonly LID_WATCHER_PIDFILE="$STATE_DIR/lid-watcher.pid"
+readonly DISPLAY_ID_FILE="$STATE_DIR/builtin-display-id"
+readonly SAVED_BRIGHTNESS_FILE="$STATE_DIR/saved-brightness"
 readonly TIMER_PIDFILE="$STATE_DIR/timer.pid"
 readonly OFF_AT_FILE="$STATE_DIR/off_at"
+readonly BRIGHTNESS_BIN="${NOSLEEP_BRIGHTNESS_BIN:-$SCRIPT_DIR/nosleep-brightness}"
+readonly IOREG_BIN="${NOSLEEP_IOREG_BIN:-ioreg}"
 readonly DEFAULT_DURATION="3h"
 
 log() { printf '%s\n' "$*"; }
@@ -48,6 +56,12 @@ preflight() {
     command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
   done
   mkdir -p "$STATE_DIR"
+}
+
+preflight_lid_brightness() {
+  command -v "$IOREG_BIN" >/dev/null 2>&1 || die "required command not found: $IOREG_BIN"
+  [[ -x "$BRIGHTNESS_BIN" ]] || die "brightness helper not found: $BRIGHTNESS_BIN (run 'make install')."
+  "$BRIGHTNESS_BIN" --help >/dev/null 2>&1 || die "brightness helper is not usable."
 }
 
 # Parse a duration into seconds. Accepts Nh, Nm, Ns, or bare N (hours).
@@ -124,11 +138,121 @@ caffeinate_running() {
   is_our_caffeinate "$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
 }
 
+is_our_lid_watcher() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *"_watch-lid"* ]]
+}
+
+lid_watcher_running() {
+  is_our_lid_watcher "$(cat "$LID_WATCHER_PIDFILE" 2>/dev/null || true)"
+}
+
+start_lid_watcher() {
+  local secs="$1"
+  nohup bash "$SCRIPT_PATH" _watch-lid "$secs" >/dev/null 2>&1 </dev/null &
+  echo $! > "$LID_WATCHER_PIDFILE"
+}
+
+stop_lid_watcher() {
+  local mode="${1:-restore}" pid i
+  pid="$(cat "$LID_WATCHER_PIDFILE" 2>/dev/null || true)"
+  if is_our_lid_watcher "$pid"; then
+    if [[ "$mode" == "preserve" ]]; then
+      kill -USR1 "$pid" 2>/dev/null || true
+    else
+      kill "$pid" 2>/dev/null || true
+    fi
+    for ((i = 0; i < 30; i++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  rm -f "$LID_WATCHER_PIDFILE"
+}
+
+read_lid_state() {
+  local value
+  value="$("$IOREG_BIN" -r -k AppleClamshellState -d 4 2>/dev/null \
+    | awk '/"AppleClamshellState"/ {print $NF; exit}')"
+  case "$value" in
+    Yes) printf 'closed\n' ;;
+    No)  printf 'open\n' ;;
+    *)   return 1 ;;
+  esac
+}
+
+restore_saved_brightness() {
+  local display_id saved
+  [[ -f "$SAVED_BRIGHTNESS_FILE" ]] || return 0
+  display_id="$(cat "$DISPLAY_ID_FILE" 2>/dev/null || true)"
+  saved="$(cat "$SAVED_BRIGHTNESS_FILE" 2>/dev/null || true)"
+  [[ -n "$saved" ]] || return 1
+  if { [[ "$display_id" =~ ^[0-9]+$ ]] \
+      && "$BRIGHTNESS_BIN" --display "$display_id" set "$saved" >/dev/null 2>&1; } \
+      || "$BRIGHTNESS_BIN" set "$saved" >/dev/null 2>&1; then
+    rm -f "$DISPLAY_ID_FILE" "$SAVED_BRIGHTNESS_FILE"
+    return 0
+  fi
+  return 1
+}
+
+cmd_watch_lid() {
+  local secs="$1" deadline state previous_state="" snapshot display_id="" saved="" preserve_state=0 i
+  [[ "$secs" =~ ^[0-9]+$ ]] && [[ "$secs" -gt 0 ]] || exit 1
+  mkdir -p "$STATE_DIR"
+  deadline=$(( $(date +%s) + secs ))
+  display_id="$(cat "$DISPLAY_ID_FILE" 2>/dev/null || true)"
+  saved="$(cat "$SAVED_BRIGHTNESS_FILE" 2>/dev/null || true)"
+
+  cleanup_lid_watcher() {
+    if [[ "$preserve_state" != "1" ]]; then
+      for ((i = 0; i < 5; i++)); do
+        restore_saved_brightness && break
+        sleep 0.1
+      done
+    fi
+    rm -f "$LID_WATCHER_PIDFILE"
+  }
+  trap 'preserve_state=1; exit 0' USR1
+  trap 'exit 0' INT TERM HUP
+  trap cleanup_lid_watcher EXIT
+
+  while [[ "$(date +%s)" -lt "$deadline" ]]; do
+    if state="$(read_lid_state)"; then
+      if [[ "$state" == "open" && "$previous_state" != "open" ]]; then
+        restore_saved_brightness || true
+        if snapshot="$("$BRIGHTNESS_BIN" snapshot 2>/dev/null)"; then
+          display_id="${snapshot%% *}"
+          saved="${snapshot#* }"
+        fi
+      elif [[ "$state" == "closed" && "$previous_state" != "closed" ]]; then
+        if [[ "$display_id" =~ ^[0-9]+$ && -n "$saved" ]]; then
+          if [[ "$previous_state" == "open" ]]; then
+            saved="$("$BRIGHTNESS_BIN" --display "$display_id" get 2>/dev/null || printf '%s' "$saved")"
+          fi
+          printf '%s\n' "$display_id" > "$DISPLAY_ID_FILE"
+          printf '%s\n' "$saved" > "$SAVED_BRIGHTNESS_FILE"
+          if ! "$BRIGHTNESS_BIN" --display "$display_id" set 0 >/dev/null 2>&1; then
+            rm -f "$DISPLAY_ID_FILE" "$SAVED_BRIGHTNESS_FILE"
+          fi
+        fi
+      fi
+      previous_state="$state"
+    fi
+    sleep 1
+  done
+  trap - EXIT
+  cleanup_lid_watcher
+}
+
 cmd_on() {
   local dur="${1:-$DEFAULT_DURATION}" secs off_at_human
   if ! secs="$(parse_duration "$dur")"; then
     die "invalid duration: '$dur' (use 3h, 90m, 45s, or a bare number of hours)"
   fi
+  preflight_lid_brightness
   off_at_human="$(date -v"+${secs}S" '+%I:%M %p')"
 
   log "Disabling sleep for $dur."
@@ -137,12 +261,14 @@ cmd_on() {
   sudo bash -c "
     $(cancel_timer_snippet)
     pmset -a disablesleep 1
-    nohup bash -c 'sleep $secs; pmset -a disablesleep 0; rm -f \"$TIMER_PIDFILE\" \"$OFF_AT_FILE\"' >/dev/null 2>&1 </dev/null &
+    nohup bash -c 'sleep $secs; i=0; while [ -f \"$LID_WATCHER_PIDFILE\" ] && [ \$i -lt 30 ]; do sleep 0.1; i=\$((i + 1)); done; pmset -a disablesleep 0; rm -f \"$TIMER_PIDFILE\" \"$OFF_AT_FILE\" \"$LID_WATCHER_PIDFILE\"' >/dev/null 2>&1 </dev/null &
     echo \$! > '$TIMER_PIDFILE'
   "
 
+  stop_lid_watcher preserve
   stop_caffeinate
   start_caffeinate "$secs"
+  start_lid_watcher "$secs"
   echo "$(( $(date +%s) + secs ))" > "$OFF_AT_FILE"
 
   log "Sleep disabled. Auto-off at $off_at_human (or run 'nosleep off')."
@@ -150,6 +276,9 @@ cmd_on() {
 
 cmd_off() {
   log "Restoring normal sleep behavior."
+  sudo -v
+  stop_lid_watcher
+  restore_saved_brightness || true
   sudo bash -c "
     $(cancel_timer_snippet)
     pmset -a disablesleep 0
@@ -172,6 +301,8 @@ cmd_status() {
     # Any leftover timer/off_at state is stale — e.g. after a reboot, which
     # resets disablesleep but leaves these files behind. Clean it up so we
     # never report a phantom auto-off below.
+    stop_lid_watcher
+    restore_saved_brightness || true
     rm -f "$OFF_AT_FILE" "$TIMER_PIDFILE"
     log "disablesleep : off (normal sleep behavior)"
   fi
@@ -180,6 +311,12 @@ cmd_status() {
     log "caffeinate   : running"
   else
     log "caffeinate   : not running"
+  fi
+
+  if lid_watcher_running; then
+    log "lid watcher  : running"
+  else
+    log "lid watcher  : not running"
   fi
 
   if [[ "$ds" == "1" && -f "$OFF_AT_FILE" ]]; then
@@ -198,6 +335,7 @@ case "${1:-}" in
   on)                   preflight; cmd_on "${2:-}" ;;
   off)                  preflight; cmd_off ;;
   status)               preflight; cmd_status ;;
+  _watch-lid)           cmd_watch_lid "${2:-}" ;;
   -h|--help|help)       usage ;;
   *)                    usage >&2; exit 1 ;;
 esac
