@@ -2,18 +2,21 @@
 #
 # nosleep — keep this Mac awake, even with the lid closed (clamshell mode).
 #
-#   nosleep on [DURATION]   Disable sleep (survives closing the lid), auto-off later
+#   nosleep on [DURATION] [--battery [N]]   Disable sleep, auto-off later
 #   nosleep off             Restore normal sleep behavior now
 #   nosleep status          Show current state and time remaining
 #   nosleep --help          Show usage
 #
 # DURATION defaults to 3h. Accepts 3h, 90m, 45s, or a bare number (= hours).
+# --battery [N] also flips sleep back on when charge drops to/below N% (default
+# 20) while unplugged; omit the flag to keep the time-only guardrail.
 #
 # "on" uses `sudo pmset -a disablesleep 1`, the switch that keeps the machine
 # awake even with the lid shut, runs `caffeinate`, and dims the built-in display
-# while the lid is closed. A background timer (running as root, so it needs no
-# second password) flips sleep back on after DURATION as a guardrail. "off"
-# reverses everything immediately. Note: macOS resets disablesleep on reboot.
+# while the lid is closed. A background guardrail (running as root, so it needs
+# no second password) flips sleep back on after DURATION — or early on low
+# battery. "off" reverses everything immediately. Note: macOS resets
+# disablesleep on reboot.
 #
 set -euo pipefail
 
@@ -27,19 +30,24 @@ readonly DISPLAY_ID_FILE="$STATE_DIR/builtin-display-id"
 readonly SAVED_BRIGHTNESS_FILE="$STATE_DIR/saved-brightness"
 readonly TIMER_PIDFILE="$STATE_DIR/timer.pid"
 readonly OFF_AT_FILE="$STATE_DIR/off_at"
+readonly BATTERY_THRESHOLD_FILE="$STATE_DIR/battery_threshold"
 readonly BRIGHTNESS_BIN="${NOSLEEP_BRIGHTNESS_BIN:-$SCRIPT_DIR/nosleep-brightness}"
 readonly IOREG_BIN="${NOSLEEP_IOREG_BIN:-ioreg}"
+readonly PMSET_BIN="${NOSLEEP_PMSET_BIN:-pmset}"
 readonly DEFAULT_DURATION="3h"
+readonly DEFAULT_BATTERY_THRESHOLD=20
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'nosleep: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<USAGE
-Usage: nosleep <on [DURATION] | off | status>
+Usage: nosleep <on [DURATION] [--battery [N]] | off | status>
 
-  on [DURATION]   Disable sleep (survives lid close), auto-off after DURATION
+  on [DURATION]   Disable sleep (survives lid close), auto-off after DURATION.
                   DURATION defaults to $DEFAULT_DURATION. Accepts 3h, 90m, 45s, or bare hours.
+     --battery [N]  Also auto-off when charge drops to/below N% while on
+                    battery power (default $DEFAULT_BATTERY_THRESHOLD; N is 1-99).
   off             Restore normal sleep behavior now
   status          Show current state and time remaining
 
@@ -87,17 +95,17 @@ is_our_caffeinate() {
   [[ "$(ps -p "$pid" -o comm= 2>/dev/null)" == *caffeinate ]]
 }
 
-# True if the given PID is live and actually our root-owned auto-off timer.
+# True if the given PID is live and actually our root-owned auto-off guardrail.
 # The pidfile lives in a user-writable dir, so validate before ever handing a
 # value to the root shell: reject non-numeric junk, then confirm the process
-# command line is the timer we armed (guards against a recycled/stale PID).
-# No `kill -0` here: the timer is root-owned, so signalling it from the user
+# command line is the guardrail we armed (guards against a recycled/stale PID).
+# No `kill -0` here: the guardrail is root-owned, so signalling it from the user
 # would fail with EPERM even while it's alive. `ps` sees it regardless of
 # ownership, so the command-line match confirms both existence and identity.
 is_our_timer() {
   local pid="$1"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *"pmset -a disablesleep 0"* ]]
+  [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *"_guardrail"* ]]
 }
 
 # Emit the root-shell snippet that cancels a pending auto-off timer, run inside
@@ -183,6 +191,31 @@ read_lid_state() {
   esac
 }
 
+# True iff running on battery power AND charge <= threshold. Reads `pmset -g
+# batt` (no root needed). On AC power, or when the reading can't be parsed,
+# returns false — a bad read must never force sleep back on.
+battery_should_trigger() {
+  local threshold="$1" out matches pct
+  [[ "$threshold" =~ ^[0-9]+$ ]] && [[ "$threshold" -gt 0 ]] || return 1
+  out="$("$PMSET_BIN" -g batt 2>/dev/null)" || return 1
+  [[ "$out" == *"'Battery Power'"* ]] || return 1
+  matches="$(printf '%s\n' "$out" | grep -oE '[0-9]+%' | tr -d '%' || true)"
+  pct="${matches%%$'\n'*}"
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pct" -le "$threshold" ]]
+}
+
+# Print "NN%, on battery" / "NN%, on AC" for `status`. Fails if unparseable.
+battery_status_line() {
+  local out matches pct src
+  out="$("$PMSET_BIN" -g batt 2>/dev/null)" || return 1
+  matches="$(printf '%s\n' "$out" | grep -oE '[0-9]+%' || true)"
+  pct="${matches%%$'\n'*}"
+  [[ -n "$pct" ]] || return 1
+  if [[ "$out" == *"'Battery Power'"* ]]; then src="on battery"; else src="on AC"; fi
+  printf '%s, %s' "$pct" "$src"
+}
+
 restore_saved_brightness() {
   local display_id saved
   [[ -f "$SAVED_BRIGHTNESS_FILE" ]] || return 0
@@ -247,21 +280,92 @@ cmd_watch_lid() {
   cleanup_lid_watcher
 }
 
+# Root-owned auto-off guardrail (started detached by cmd_on). Waits out DURATION,
+# or exits early if the battery drops to/below THRESHOLD while unplugged
+# (THRESHOLD 0 = time-only, the historical behavior). On exit it re-enables sleep
+# and clears the run's state. Runs as root in production so it can flip
+# disablesleep back on without a second password.
+cmd_guardrail() {
+  local secs="$1" threshold="${2:-0}" deadline poll early=0 i
+  [[ "$secs" =~ ^[0-9]+$ ]] && [[ "$secs" -gt 0 ]] || exit 1
+  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=0
+
+  if [[ "$threshold" -gt 0 ]]; then
+    poll="${NOSLEEP_POLL_INTERVAL:-30}"
+    deadline=$(( $(date +%s) + secs ))
+    while [[ "$(date +%s)" -lt "$deadline" ]]; do
+      if battery_should_trigger "$threshold"; then
+        early=1
+        break
+      fi
+      sleep "$poll"
+    done
+  else
+    sleep "$secs"
+  fi
+
+  # An early (battery) exit fires before caffeinate and the lid watcher hit
+  # their own deadlines, so stop them now; killing the lid watcher triggers its
+  # brightness-restore trap. On a normal deadline exit both self-expire and we
+  # only wait for the lid watcher to clear its pidfile below.
+  if [[ "$early" == "1" ]]; then
+    stop_caffeinate
+    local lid_pid
+    lid_pid="$(cat "$LID_WATCHER_PIDFILE" 2>/dev/null || true)"
+    if is_our_lid_watcher "$lid_pid"; then
+      kill "$lid_pid" 2>/dev/null || true
+    fi
+  fi
+
+  for ((i = 0; i < 30; i++)); do
+    [[ -f "$LID_WATCHER_PIDFILE" ]] || break
+    sleep 0.1
+  done
+
+  "$PMSET_BIN" -a disablesleep 0
+  rm -f "$TIMER_PIDFILE" "$OFF_AT_FILE" "$LID_WATCHER_PIDFILE" "$BATTERY_THRESHOLD_FILE"
+}
+
 cmd_on() {
-  local dur="${1:-$DEFAULT_DURATION}" secs off_at_human
+  local dur="" threshold=0 secs off_at_human arg
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      --battery)
+        threshold="$DEFAULT_BATTERY_THRESHOLD"
+        # Consume the next token as the threshold only if it's a bare integer;
+        # otherwise it's the duration (or another flag) and --battery uses its default.
+        if [[ "${2:-}" =~ ^[0-9]+$ ]]; then threshold="$2"; shift; fi
+        ;;
+      --battery=*) threshold="${arg#--battery=}" ;;
+      -*)          die "unknown option: '$arg'" ;;
+      *)
+        [[ -z "$dur" ]] || die "unexpected argument: '$arg'"
+        dur="$arg"
+        ;;
+    esac
+    shift
+  done
+  dur="${dur:-$DEFAULT_DURATION}"
+
   if ! secs="$(parse_duration "$dur")"; then
     die "invalid duration: '$dur' (use 3h, 90m, 45s, or a bare number of hours)"
+  fi
+  if [[ "$threshold" != "0" ]]; then
+    { [[ "$threshold" =~ ^[0-9]+$ ]] && [[ "$threshold" -ge 1 ]] && [[ "$threshold" -le 99 ]]; } \
+      || die "invalid battery threshold: '$threshold' (use 1-99)"
   fi
   preflight_lid_brightness
   off_at_human="$(date -v"+${secs}S" '+%I:%M %p')"
 
   log "Disabling sleep for $dur."
-  # One sudo call: cancel any prior timer, disable sleep, arm a root-owned timer
-  # that re-enables sleep after DURATION without needing a second password.
+  # One sudo call: cancel any prior guardrail, disable sleep, arm a root-owned
+  # guardrail that re-enables sleep after DURATION (or early on low battery)
+  # without needing a second password.
   sudo bash -c "
     $(cancel_timer_snippet)
     pmset -a disablesleep 1
-    nohup bash -c 'sleep $secs; i=0; while [ -f \"$LID_WATCHER_PIDFILE\" ] && [ \$i -lt 30 ]; do sleep 0.1; i=\$((i + 1)); done; pmset -a disablesleep 0; rm -f \"$TIMER_PIDFILE\" \"$OFF_AT_FILE\" \"$LID_WATCHER_PIDFILE\"' >/dev/null 2>&1 </dev/null &
+    nohup bash '$SCRIPT_PATH' _guardrail $secs $threshold >/dev/null 2>&1 </dev/null &
     echo \$! > '$TIMER_PIDFILE'
   "
 
@@ -270,8 +374,13 @@ cmd_on() {
   start_caffeinate "$secs"
   start_lid_watcher "$secs"
   echo "$(( $(date +%s) + secs ))" > "$OFF_AT_FILE"
-
-  log "Sleep disabled. Auto-off at $off_at_human (or run 'nosleep off')."
+  if [[ "$threshold" != "0" ]]; then
+    echo "$threshold" > "$BATTERY_THRESHOLD_FILE"
+    log "Sleep disabled. Auto-off at $off_at_human or when battery <= ${threshold}% (or run 'nosleep off')."
+  else
+    rm -f "$BATTERY_THRESHOLD_FILE"
+    log "Sleep disabled. Auto-off at $off_at_human (or run 'nosleep off')."
+  fi
 }
 
 cmd_off() {
@@ -284,7 +393,7 @@ cmd_off() {
     pmset -a disablesleep 0
   "
   stop_caffeinate
-  rm -f "$OFF_AT_FILE"
+  rm -f "$OFF_AT_FILE" "$BATTERY_THRESHOLD_FILE"
   log "Sleep restored to normal."
 }
 
@@ -303,7 +412,7 @@ cmd_status() {
     # never report a phantom auto-off below.
     stop_lid_watcher
     restore_saved_brightness || true
-    rm -f "$OFF_AT_FILE" "$TIMER_PIDFILE"
+    rm -f "$OFF_AT_FILE" "$TIMER_PIDFILE" "$BATTERY_THRESHOLD_FILE"
     log "disablesleep : off (normal sleep behavior)"
   fi
 
@@ -329,13 +438,26 @@ cmd_status() {
         $((rem / 3600)) $(((rem % 3600) / 60)) "$(date -r "$off_at" '+%I:%M %p')"
     fi
   fi
+
+  if [[ "$ds" == "1" && -f "$BATTERY_THRESHOLD_FILE" ]]; then
+    local thr now_line
+    thr="$(cat "$BATTERY_THRESHOLD_FILE" 2>/dev/null || true)"
+    if [[ "$thr" =~ ^[0-9]+$ ]]; then
+      if now_line="$(battery_status_line)"; then
+        log "battery      : auto-off <= ${thr}% (currently ${now_line})"
+      else
+        log "battery      : auto-off <= ${thr}%"
+      fi
+    fi
+  fi
 }
 
 case "${1:-}" in
-  on)                   preflight; cmd_on "${2:-}" ;;
+  on)                   preflight; cmd_on "${@:2}" ;;
   off)                  preflight; cmd_off ;;
   status)               preflight; cmd_status ;;
   _watch-lid)           cmd_watch_lid "${2:-}" ;;
+  _guardrail)           cmd_guardrail "${2:-}" "${3:-}" ;;
   -h|--help|help)       usage ;;
   *)                    usage >&2; exit 1 ;;
 esac
