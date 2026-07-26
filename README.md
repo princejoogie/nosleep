@@ -52,14 +52,22 @@ install -m 755 "$PWD/nosleep-brightness" ~/.local/bin/nosleep-brightness
 ## Usage
 
 ```sh
-nosleep on          # disable sleep for 3h (default), then auto-restore
-nosleep on 90m      # custom window — accepts 3h, 90m, 45s, or a bare number (hours)
-nosleep off         # restore normal sleep immediately
-nosleep status      # show current state and time remaining
-nosleep --help      # usage
+nosleep on                    # disable sleep for 3h (default), then auto-restore
+nosleep on 90m                # custom window — accepts 3h, 90m, 45s, or a bare number (hours)
+nosleep on 3h --battery=10    # move the low-battery cutoff (default 20%, range 1–99)
+nosleep on 3h --no-battery    # time-only — run the full window whatever the charge
+nosleep off                   # restore normal sleep immediately
+nosleep status                # show current state and time remaining
+nosleep --help                # usage
 ```
 
 `on` and `off` run `sudo pmset` and may prompt for your password. `status` is read-only and needs no password. Running `on` again while already active just refreshes the window with the new duration.
+
+**Sleep also comes back on at 20% charge**, not just when the window ends: if the charge drops to/below the threshold **while running on battery**, the guardrail restores sleep early. On AC power a low reading is ignored, since it's charging. This is on by default — leaving an unplugged Mac awake in clamshell mode until it drains flat is the worse failure.
+
+The 20% default sits above macOS's own low-battery warning (~10%) and emergency sleep (~2–3%), leaving headroom for the 30s poll interval and a graceful sleep with charge to spare. Adjust it with `--battery=N` (1–99): lower it (say 10–15%) to squeeze out more unplugged runtime, or raise it to bail out earlier. `--no-battery` turns it off entirely and auto-offs on DURATION alone.
+
+The threshold is only read from `--battery=N`, never a separate `--battery N` token — a bare number is always the duration in hours. On a Mac with no battery the guardrail is skipped, since it could never fire.
 
 Example `status` output:
 
@@ -68,6 +76,7 @@ disablesleep : ON  (Mac will not sleep, even with the lid closed)
 caffeinate   : running
 lid watcher  : running
 auto-off in  : 2h 47m (at 04:53 AM)
+battery      : auto-off <= 20% (currently 63%, on battery)
 ```
 
 ## How it works
@@ -76,9 +85,10 @@ auto-off in  : 2h 47m (at 04:53 AM)
 - **`caffeinate -dimsu`** runs alongside it so the display, disk, and system stay awake. It's bounded to the same window and `nohup`'d, so it survives closing the terminal.
 - **Lid watcher:** `ioreg` reports `AppleClamshellState`. The watcher caches the built-in display ID while the lid is open, so it can save the current brightness and set that display to zero even after macOS removes it from the online display list. It restores the saved value when the lid opens, `nosleep off` runs, or the timer expires.
 - **Brightness helper:** the bundled Swift script uses macOS's private `DisplayServices` framework to control the built-in display. Because this is a private API, a future macOS release could require an update.
-- **Auto-off timer:** the re-enable command is spawned inside the same `sudo` call, so it runs as root and restores sleep after the duration without asking for your password again. It waits briefly for the user-session lid watcher to restore brightness before re-enabling lid sleep. This means a short-lived root-owned `sleep` process lingers until it fires (or until `nosleep off` kills it).
-- **`off`** restores brightness, cancels the pending timer, and restores normal sleep immediately.
-- **State** lives in `$XDG_STATE_HOME/nosleep` (defaults to `~/.local/state/nosleep`): PID files for `caffeinate`, the lid watcher, and the timer; the cached display ID and saved brightness; and the scheduled auto-off time. `status` cleans up stale state on its own (e.g. after a reboot).
+- **Auto-off guardrail:** the re-enable command is spawned inside the same `sudo` call, so it runs as root and restores sleep after the duration without asking for your password again. It waits briefly for the user-session lid watcher to restore brightness before re-enabling lid sleep. This means a short-lived root-owned process lingers until it fires (or until `nosleep off` kills it).
+- **Low-battery guardrail:** unless you pass `--no-battery`, that same root process also polls `pmset -g batt` every 30s. If the charge reaches the threshold (default 20%) while on battery power, it restores sleep early — tearing down `caffeinate` and the lid watcher (which restores brightness) first. On AC power a low reading never triggers it.
+- **`off`** restores brightness, cancels the pending guardrail, and restores normal sleep immediately.
+- **State** lives in `$XDG_STATE_HOME/nosleep` (defaults to `~/.local/state/nosleep`): PID files for `caffeinate`, the lid watcher, and the guardrail; the cached display ID and saved brightness; the scheduled auto-off time; and the battery threshold when armed. `status` cleans up stale state on its own (e.g. after a reboot).
 - **Reboots reset it.** macOS clears `disablesleep` on restart, so re-run `nosleep on` after booting — and it can never get stuck on across reboots.
 - **Heat.** Heavy workloads with the lid closed trap heat, since the keyboard deck is where it vents — keep an eye on it under sustained load.
 
