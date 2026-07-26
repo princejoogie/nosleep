@@ -2,14 +2,14 @@
 #
 # nosleep — keep this Mac awake, even with the lid closed (clamshell mode).
 #
-#   nosleep on [DURATION] [--battery [N]]   Disable sleep, auto-off later
+#   nosleep on [DURATION] [--battery[=N]]   Disable sleep, auto-off later
 #   nosleep off             Restore normal sleep behavior now
 #   nosleep status          Show current state and time remaining
 #   nosleep --help          Show usage
 #
 # DURATION defaults to 3h. Accepts 3h, 90m, 45s, or a bare number (= hours).
-# --battery [N] also flips sleep back on when charge drops to/below N% (default
-# 20) while unplugged; omit the flag to keep the time-only guardrail.
+# --battery also flips sleep back on when charge drops to/below 20% while
+# unplugged; --battery=N sets the threshold. Omit it for a time-only guardrail.
 #
 # "on" uses `sudo pmset -a disablesleep 1`, the switch that keeps the machine
 # awake even with the lid shut, runs `caffeinate`, and dims the built-in display
@@ -23,7 +23,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR SCRIPT_PATH
-readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nosleep"
+# NOSLEEP_STATE_DIR is how cmd_on hands the resolved path to the root-owned
+# guardrail: sudo's env_reset drops XDG_STATE_HOME, so the guardrail can't
+# re-derive the same directory on its own.
+readonly STATE_DIR="${NOSLEEP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/nosleep}"
 readonly CAFFEINATE_PIDFILE="$STATE_DIR/caffeinate.pid"
 readonly LID_WATCHER_PIDFILE="$STATE_DIR/lid-watcher.pid"
 readonly DISPLAY_ID_FILE="$STATE_DIR/builtin-display-id"
@@ -36,18 +39,24 @@ readonly IOREG_BIN="${NOSLEEP_IOREG_BIN:-ioreg}"
 readonly PMSET_BIN="${NOSLEEP_PMSET_BIN:-pmset}"
 readonly DEFAULT_DURATION="3h"
 readonly DEFAULT_BATTERY_THRESHOLD=20
+# Bad values would make the guardrail's `sleep` fail and leave sleep disabled
+# for good, so fall back rather than trust the override.
+POLL_INTERVAL="${NOSLEEP_POLL_INTERVAL:-30}"
+[[ "$POLL_INTERVAL" =~ ^[1-9][0-9]*$ ]] || POLL_INTERVAL=30
+readonly POLL_INTERVAL
 
 log() { printf '%s\n' "$*"; }
-die() { printf 'nosleep: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'nosleep: %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
 
 usage() {
   cat <<USAGE
-Usage: nosleep <on [DURATION] [--battery [N]] | off | status>
+Usage: nosleep <on [DURATION] [--battery[=N]] | off | status>
 
   on [DURATION]   Disable sleep (survives lid close), auto-off after DURATION.
                   DURATION defaults to $DEFAULT_DURATION. Accepts 3h, 90m, 45s, or bare hours.
-     --battery [N]  Also auto-off when charge drops to/below N% while on
-                    battery power (default $DEFAULT_BATTERY_THRESHOLD; N is 1-99).
+     --battery      Also auto-off at $DEFAULT_BATTERY_THRESHOLD% charge while on battery power
+     --battery=N    ...with a custom threshold (N is 1-99)
   off             Restore normal sleep behavior now
   status          Show current state and time remaining
 
@@ -64,6 +73,14 @@ preflight() {
     command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
   done
   mkdir -p "$STATE_DIR"
+}
+
+# cmd_on/cmd_off interpolate these paths single-quoted into a root shell string,
+# where a literal quote would break out of the quoting. `status` never builds
+# that string, so it stays usable either way.
+assert_quote_free_paths() {
+  [[ "$SCRIPT_PATH$STATE_DIR$PMSET_BIN" != *"'"* ]] \
+    || die "install path, state dir, and pmset path must not contain a single quote."
 }
 
 preflight_lid_brightness() {
@@ -191,29 +208,41 @@ read_lid_state() {
   esac
 }
 
-# True iff running on battery power AND charge <= threshold. Reads `pmset -g
-# batt` (no root needed). On AC power, or when the reading can't be parsed,
-# returns false — a bad read must never force sleep back on.
-battery_should_trigger() {
-  local threshold="$1" out matches pct
-  [[ "$threshold" =~ ^[0-9]+$ ]] && [[ "$threshold" -gt 0 ]] || return 1
+# Print "PCT SOURCE" (e.g. "63 battery", "63 ac") from a single `pmset -g batt`
+# read — no root needed. Fails if the charge can't be parsed, which is also how
+# a Mac with no battery reads. Shared by the poll loop and `status` so the
+# parse lives in exactly one place.
+battery_read() {
+  local out
   out="$("$PMSET_BIN" -g batt 2>/dev/null)" || return 1
-  [[ "$out" == *"'Battery Power'"* ]] || return 1
-  matches="$(printf '%s\n' "$out" | grep -oE '[0-9]+%' | tr -d '%' || true)"
-  pct="${matches%%$'\n'*}"
-  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
-  [[ "$pct" -le "$threshold" ]]
+  [[ "$out" =~ ([0-9]+)% ]] || return 1
+  if [[ "$out" == *"'Battery Power'"* ]]; then
+    printf '%s battery\n' "${BASH_REMATCH[1]}"
+  else
+    printf '%s ac\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# True iff running on battery power AND charge <= threshold. On AC power, or
+# when the reading can't be parsed, returns false — a bad read must never force
+# sleep back on.
+battery_should_trigger() {
+  local threshold="$1" reading
+  [[ "$threshold" =~ ^[0-9]+$ ]] && [[ "$threshold" -gt 0 ]] || return 1
+  reading="$(battery_read)" || return 1
+  [[ "$reading" == *" battery" ]] || return 1
+  [[ "${reading%% *}" -le "$threshold" ]]
 }
 
 # Print "NN%, on battery" / "NN%, on AC" for `status`. Fails if unparseable.
 battery_status_line() {
-  local out matches pct src
-  out="$("$PMSET_BIN" -g batt 2>/dev/null)" || return 1
-  matches="$(printf '%s\n' "$out" | grep -oE '[0-9]+%' || true)"
-  pct="${matches%%$'\n'*}"
-  [[ -n "$pct" ]] || return 1
-  if [[ "$out" == *"'Battery Power'"* ]]; then src="on battery"; else src="on AC"; fi
-  printf '%s, %s' "$pct" "$src"
+  local reading
+  reading="$(battery_read)" || return 1
+  if [[ "$reading" == *" battery" ]]; then
+    printf '%s%%, on battery' "${reading%% *}"
+  else
+    printf '%s%%, on AC' "${reading%% *}"
+  fi
 }
 
 restore_saved_brightness() {
@@ -286,19 +315,26 @@ cmd_watch_lid() {
 # and clears the run's state. Runs as root in production so it can flip
 # disablesleep back on without a second password.
 cmd_guardrail() {
-  local secs="$1" threshold="${2:-0}" deadline poll early=0 i
+  local secs="$1" threshold="${2:-0}" deadline remaining early=0 i
   [[ "$secs" =~ ^[0-9]+$ ]] && [[ "$secs" -gt 0 ]] || exit 1
-  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=0
+  if [[ "$threshold" =~ ^[0-9]{1,3}$ ]]; then
+    threshold=$((10#$threshold))
+  else
+    threshold=0
+  fi
 
   if [[ "$threshold" -gt 0 ]]; then
-    poll="${NOSLEEP_POLL_INTERVAL:-30}"
     deadline=$(( $(date +%s) + secs ))
-    while [[ "$(date +%s)" -lt "$deadline" ]]; do
+    while :; do
+      remaining=$(( deadline - $(date +%s) ))
+      [[ "$remaining" -gt 0 ]] || break
       if battery_should_trigger "$threshold"; then
         early=1
         break
       fi
-      sleep "$poll"
+      # Never sleep past the deadline, or the timed auto-off would land up to a
+      # full poll interval after the time `status` advertised.
+      if [[ "$remaining" -lt "$POLL_INTERVAL" ]]; then sleep "$remaining"; else sleep "$POLL_INTERVAL"; fi
     done
   else
     sleep "$secs"
@@ -306,38 +342,35 @@ cmd_guardrail() {
 
   # An early (battery) exit fires before caffeinate and the lid watcher hit
   # their own deadlines, so stop them now; killing the lid watcher triggers its
-  # brightness-restore trap. On a normal deadline exit both self-expire and we
-  # only wait for the lid watcher to clear its pidfile below.
+  # brightness-restore trap, and stop_lid_watcher waits out the process. On a
+  # normal deadline exit both self-expire, so we only wait for the lid watcher
+  # to clear its pidfile — the signal that its trap has finished restoring.
   if [[ "$early" == "1" ]]; then
     stop_caffeinate
-    local lid_pid
-    lid_pid="$(cat "$LID_WATCHER_PIDFILE" 2>/dev/null || true)"
-    if is_our_lid_watcher "$lid_pid"; then
-      kill "$lid_pid" 2>/dev/null || true
-    fi
+    stop_lid_watcher
+  else
+    for ((i = 0; i < 30; i++)); do
+      [[ -f "$LID_WATCHER_PIDFILE" ]] || break
+      sleep 0.1
+    done
   fi
-
-  for ((i = 0; i < 30; i++)); do
-    [[ -f "$LID_WATCHER_PIDFILE" ]] || break
-    sleep 0.1
-  done
 
   "$PMSET_BIN" -a disablesleep 0
   rm -f "$TIMER_PIDFILE" "$OFF_AT_FILE" "$LID_WATCHER_PIDFILE" "$BATTERY_THRESHOLD_FILE"
 }
 
 cmd_on() {
-  local dur="" threshold=0 secs off_at_human arg
+  # Armed-ness is tracked apart from the value so that no threshold the user can
+  # type — '0', '' — doubles as "unarmed" and disables the guardrail silently.
+  # A value only ever comes from `--battery=N`: DURATION accepts a bare number of
+  # hours, so a separate `--battery N` token would be ambiguous.
+  local dur="" threshold="$DEFAULT_BATTERY_THRESHOLD" battery=0 secs off_at_human arg
+  assert_quote_free_paths
   while [[ $# -gt 0 ]]; do
     arg="$1"
     case "$arg" in
-      --battery)
-        threshold="$DEFAULT_BATTERY_THRESHOLD"
-        # Consume the next token as the threshold only if it's a bare integer;
-        # otherwise it's the duration (or another flag) and --battery uses its default.
-        if [[ "${2:-}" =~ ^[0-9]+$ ]]; then threshold="$2"; shift; fi
-        ;;
-      --battery=*) threshold="${arg#--battery=}" ;;
+      --battery)   battery=1; threshold="$DEFAULT_BATTERY_THRESHOLD" ;;
+      --battery=*) battery=1; threshold="${arg#--battery=}" ;;
       -*)          die "unknown option: '$arg'" ;;
       *)
         [[ -z "$dur" ]] || die "unexpected argument: '$arg'"
@@ -351,9 +384,15 @@ cmd_on() {
   if ! secs="$(parse_duration "$dur")"; then
     die "invalid duration: '$dur' (use 3h, 90m, 45s, or a bare number of hours)"
   fi
-  if [[ "$threshold" != "0" ]]; then
-    { [[ "$threshold" =~ ^[0-9]+$ ]] && [[ "$threshold" -ge 1 ]] && [[ "$threshold" -le 99 ]]; } \
+  if [[ "$battery" == "1" ]]; then
+    # Normalize to base 10 before comparing: bash reads a leading zero as octal,
+    # which would reject '08' outright and quietly turn '010' into 8.
+    { [[ "$threshold" =~ ^[0-9]{1,3}$ ]] \
+      && [[ "$((10#$threshold))" -ge 1 ]] && [[ "$((10#$threshold))" -le 99 ]]; } \
       || die "invalid battery threshold: '$threshold' (use 1-99)"
+    threshold="$((10#$threshold))"
+    battery_read >/dev/null \
+      || warn "no battery reading available — the --battery guardrail will never fire."
   fi
   preflight_lid_brightness
   off_at_human="$(date -v"+${secs}S" '+%I:%M %p')"
@@ -361,11 +400,14 @@ cmd_on() {
   log "Disabling sleep for $dur."
   # One sudo call: cancel any prior guardrail, disable sleep, arm a root-owned
   # guardrail that re-enables sleep after DURATION (or early on low battery)
-  # without needing a second password.
+  # without needing a second password. sudo's env_reset would otherwise strip
+  # our overrides, leaving the guardrail pointed at a different state dir.
   sudo bash -c "
     $(cancel_timer_snippet)
     pmset -a disablesleep 1
-    nohup bash '$SCRIPT_PATH' _guardrail $secs $threshold >/dev/null 2>&1 </dev/null &
+    nohup env NOSLEEP_STATE_DIR='$STATE_DIR' NOSLEEP_PMSET_BIN='$PMSET_BIN' \
+      NOSLEEP_POLL_INTERVAL='$POLL_INTERVAL' \
+      bash '$SCRIPT_PATH' _guardrail $secs $(( battery == 1 ? threshold : 0 )) >/dev/null 2>&1 </dev/null &
     echo \$! > '$TIMER_PIDFILE'
   "
 
@@ -374,7 +416,7 @@ cmd_on() {
   start_caffeinate "$secs"
   start_lid_watcher "$secs"
   echo "$(( $(date +%s) + secs ))" > "$OFF_AT_FILE"
-  if [[ "$threshold" != "0" ]]; then
+  if [[ "$battery" == "1" ]]; then
     echo "$threshold" > "$BATTERY_THRESHOLD_FILE"
     log "Sleep disabled. Auto-off at $off_at_human or when battery <= ${threshold}% (or run 'nosleep off')."
   else
@@ -384,6 +426,7 @@ cmd_on() {
 }
 
 cmd_off() {
+  assert_quote_free_paths
   log "Restoring normal sleep behavior."
   sudo -v
   stop_lid_watcher
@@ -401,7 +444,7 @@ cmd_status() {
   local ds
   # pmset reports this as "SleepDisabled" in `pmset -g`, even though it's set
   # via `pmset -a disablesleep`. Match either name, case-insensitively.
-  ds="$(pmset -g | awk 'tolower($0) ~ /sleepdisabled|disablesleep/ {print $2; exit}')"
+  ds="$("$PMSET_BIN" -g | awk 'tolower($0) ~ /sleepdisabled|disablesleep/ {print $2; exit}')"
   ds="${ds:-0}"
 
   if [[ "$ds" == "1" ]]; then
