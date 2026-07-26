@@ -1,5 +1,11 @@
 # nosleep-cli
 
+## 0.1.0
+
+### Minor Changes
+
+- [#5](https://github.com/omsimos/nosleep/pull/5) [`235f089`](https://github.com/omsimos/nosleep/commit/235f0896722f7e5e03f0b8c77b0a850ef8e46bac) Thanks [@hyamero](https://github.com/hyamero)! - Restore sleep early when the battery runs low. `nosleep on` now also auto-offs at 20% charge while running on battery power, so an unplugged Mac in clamshell mode can't drain itself flat waiting out the window. On AC power a low reading is ignored, and a Mac with no battery skips the guardrail. Use `--battery=N` (1–99) to move the threshold, or `--no-battery` for the previous time-only behavior.
+
 ## 0.0.2
 
 ### Patch Changes
