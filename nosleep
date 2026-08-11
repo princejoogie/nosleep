@@ -164,6 +164,11 @@ caffeinate_running() {
   is_our_caffeinate "$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
 }
 
+external_caffeinate_running() {
+  ps -axo comm= 2>/dev/null \
+    | awk '$0 ~ /(^|\/)caffeinate$/ { found=1 } END { exit !found }'
+}
+
 is_our_lid_watcher() {
   local pid="$1"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -173,6 +178,22 @@ is_our_lid_watcher() {
 
 lid_watcher_running() {
   is_our_lid_watcher "$(cat "$LID_WATCHER_PIDFILE" 2>/dev/null || true)"
+}
+
+external_lid_watcher_running() {
+  ps -axo comm=,command= 2>/dev/null \
+    | awk '$1 ~ /(^|\/)bash$/ && index($0, "plugin.sh _lid-monitor") { found=1 } END { exit !found }'
+}
+
+herdr_plugin_monitor_running() {
+  ps -axo comm=,command= 2>/dev/null \
+    | awk '$1 ~ /(^|\/)bash$/ && index($0, "plugin.sh _monitor") { found=1 } END { exit !found }'
+}
+
+herdr_plugin_active() {
+  herdr_plugin_monitor_running \
+    && external_caffeinate_running \
+    && external_lid_watcher_running
 }
 
 start_lid_watcher() {
@@ -453,14 +474,20 @@ cmd_off() {
 }
 
 cmd_status() {
-  local ds
+  local ds herdr_active=0 herdr_monitor=0
   # pmset reports this as "SleepDisabled" in `pmset -g`, even though it's set
   # via `pmset -a disablesleep`. Match either name, case-insensitively.
   ds="$("$PMSET_BIN" -g | awk 'tolower($0) ~ /sleepdisabled|disablesleep/ {print $2; exit}')"
   ds="${ds:-0}"
+  herdr_plugin_monitor_running && herdr_monitor=1
+  herdr_plugin_active && herdr_active=1
 
   if [[ "$ds" == "1" ]]; then
-    log "disablesleep : ON  (Mac will not sleep, even with the lid closed)"
+    if [[ "$herdr_active" == "1" ]]; then
+      log "disablesleep : ON  (managed by Herdr plugin; lid-close sleep disabled)"
+    else
+      log "disablesleep : ON  (Mac will not sleep, even with the lid closed)"
+    fi
   else
     # Any leftover timer/off_at state is stale — e.g. after a reboot, which
     # resets disablesleep but leaves these files behind. Clean it up so we
@@ -473,14 +500,28 @@ cmd_status() {
 
   if caffeinate_running; then
     log "caffeinate   : running"
+  elif [[ "$herdr_active" == "1" ]]; then
+    log "caffeinate   : running (Herdr plugin)"
+  elif external_caffeinate_running; then
+    log "caffeinate   : running (externally managed)"
   else
     log "caffeinate   : not running"
   fi
 
   if lid_watcher_running; then
     log "lid watcher  : running"
+  elif [[ "$herdr_active" == "1" ]]; then
+    log "lid watcher  : running (Herdr plugin)"
+  elif external_lid_watcher_running; then
+    log "lid watcher  : running (externally managed)"
   else
     log "lid watcher  : not running"
+  fi
+
+  if [[ "$herdr_active" == "1" ]]; then
+    log "Herdr plugin : active (live agents detected)"
+  elif [[ "$herdr_monitor" == "1" ]]; then
+    log "Herdr plugin : monitoring (no live agents)"
   fi
 
   if [[ "$ds" == "1" && -f "$OFF_AT_FILE" ]]; then
