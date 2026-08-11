@@ -2,7 +2,7 @@ id = "nosleep.agent-awake"
 name = "NoSleep for Agents"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Keep macOS awake while Herdr has live agents."
+description = "Keep macOS awake while Herdr agents are working."
 platforms = ["macos"]
 
 [[build]]

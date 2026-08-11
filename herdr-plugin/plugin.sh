@@ -47,12 +47,12 @@ battery_is_low() {
   [[ "${BASH_REMATCH[1]}" -le 20 ]]
 }
 
-has_live_agents() {
+has_working_agents() {
   local output socket found=1
   while IFS= read -r socket; do
     [[ -n "$socket" ]] || continue
     if output="$(HERDR_SOCKET_PATH="$socket" "$HERDR" agent list 2>/dev/null)" \
-        && [[ "$output" =~ \"agents\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{ ]]; then
+        && [[ "$output" =~ \"agent_status\"[[:space:]]*:[[:space:]]*\"working\" ]]; then
       found=0
       break
     fi
@@ -183,7 +183,7 @@ reconcile() {
     # this reconcile subshell's real process ID (unlike $$, which is inherited).
     /bin/sh -c 'printf "%s\n" "$PPID"' > "$LOCK_DIR/pid"
     trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
-    if [[ ! -f "$STOP_FILE" ]] && has_live_agents && ! battery_is_low; then
+    if [[ ! -f "$STOP_FILE" ]] && has_working_agents && ! battery_is_low; then
       activate
     else
       deactivate

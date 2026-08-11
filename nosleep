@@ -519,9 +519,9 @@ cmd_status() {
   fi
 
   if [[ "$herdr_active" == "1" ]]; then
-    log "Herdr plugin : active (live agents detected)"
+    log "Herdr plugin : active (working agent detected)"
   elif [[ "$herdr_monitor" == "1" ]]; then
-    log "Herdr plugin : monitoring (no live agents)"
+    log "Herdr plugin : monitoring (no working agents)"
   fi
 
   if [[ "$ds" == "1" && -f "$OFF_AT_FILE" ]]; then

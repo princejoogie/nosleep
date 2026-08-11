@@ -51,7 +51,7 @@ install -m 755 "$PWD/nosleep-brightness" ~/.local/bin/nosleep-brightness
 
 ### Herdr plugin
 
-Herdr can automatically enable no-sleep whenever it has a live agent, without
+Herdr can automatically enable no-sleep whenever an agent is actively working, without
 adding Herdr-specific commands to the `nosleep` CLI:
 
 ```sh

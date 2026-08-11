@@ -1,7 +1,7 @@
 # NoSleep for Herdr
 
-Automatically keep a Mac awake while Herdr has at least one live agent. Idle,
-working, blocked, done, and unknown agents all count until their process exits.
+Automatically keep a Mac awake while Herdr has at least one agent in the
+`working` state. Idle, blocked, done, and unknown agents do not keep it awake.
 
 ## Install
 
