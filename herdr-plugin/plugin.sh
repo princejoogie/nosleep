@@ -35,6 +35,29 @@ pid_matches() {
   [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *"$marker"* ]]
 }
 
+plugin_process_pids() {
+  local marker="$1"
+  ps -axo pid=,comm=,command= 2>/dev/null \
+    | awk -v marker="$marker" '$2 ~ /(^|\/)bash$/ && index($0, "plugin.sh " marker) { print $1 }'
+}
+
+plugin_process_running() {
+  [[ -n "$(plugin_process_pids "$1")" ]]
+}
+
+stop_plugin_processes() {
+  local marker="$1" pid i
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill "$pid" 2>/dev/null || true
+  done < <(plugin_process_pids "$marker")
+  for ((i = 0; i < 30; i++)); do
+    plugin_process_running "$marker" || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 pmset_disabled() {
   [[ "$(pmset -g | awk 'tolower($0) ~ /sleepdisabled|disablesleep/ {print $2; exit}')" == "1" ]]
 }
@@ -118,21 +141,32 @@ lid_monitor() {
   done
 }
 
+caffeinate_monitor() {
+  local child
+  caffeinate -dimsu &
+  child=$!
+  cleanup_caffeinate() {
+    kill "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+  }
+  trap 'exit 0' INT TERM HUP
+  trap cleanup_caffeinate EXIT
+  wait "$child"
+}
+
 activate() {
-  local pid
   if ! pmset_disabled; then
     sudo -n /usr/bin/pmset -a disablesleep 1
+    pmset_disabled || return 1
     touch "$OWNED_FILE"
   fi
 
-  pid="$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
-  if ! pid_matches "$pid" "caffeinate"; then
-    nohup caffeinate -dimsu >/dev/null 2>&1 </dev/null &
+  if ! plugin_process_running "_caffeinate"; then
+    nohup bash "$0" _caffeinate >/dev/null 2>&1 </dev/null &
     echo $! > "$CAFFEINATE_PIDFILE"
   fi
 
-  pid="$(cat "$LID_PIDFILE" 2>/dev/null || true)"
-  if ! pid_matches "$pid" "_lid-monitor"; then
+  if ! plugin_process_running "_lid-monitor"; then
     nohup bash "$0" _lid-monitor >/dev/null 2>&1 </dev/null &
     echo $! > "$LID_PIDFILE"
   fi
@@ -140,22 +174,17 @@ activate() {
 }
 
 deactivate() {
-  local pid lid_pid i
-  lid_pid="$(cat "$LID_PIDFILE" 2>/dev/null || true)"
-  if pid_matches "$lid_pid" "_lid-monitor"; then
-    kill "$lid_pid" 2>/dev/null || true
-    for ((i = 0; i < 20; i++)); do
-      kill -0 "$lid_pid" 2>/dev/null || break
-      sleep 0.1
-    done
-  fi
+  local pid
+  # Clean up direct caffeinate processes created by plugin versions before the
+  # identifiable wrapper was introduced.
   pid="$(cat "$CAFFEINATE_PIDFILE" 2>/dev/null || true)"
   if pid_matches "$pid" "caffeinate"; then
     kill "$pid" 2>/dev/null || true
   fi
+  stop_plugin_processes "_lid-monitor" || true
+  stop_plugin_processes "_caffeinate" || true
   restore_brightness
-  pid_matches "$lid_pid" "_lid-monitor" || rm -f "$LID_PIDFILE"
-  rm -f "$CAFFEINATE_PIDFILE" "$ACTIVE_FILE"
+  rm -f "$LID_PIDFILE" "$CAFFEINATE_PIDFILE" "$ACTIVE_FILE"
 
   if [[ -f "$OWNED_FILE" ]]; then
     if sudo -n /usr/bin/pmset -a disablesleep 0; then
@@ -191,6 +220,25 @@ reconcile() {
   )
 }
 
+deactivate_locked() {
+  (
+    local owner
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+      if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null \
+          && [[ "$(ps -p "$owner" -o command= 2>/dev/null)" == *"plugin.sh"* ]]; then
+        exit 0
+      fi
+      rm -f "$LOCK_DIR/pid"
+      rmdir "$LOCK_DIR" 2>/dev/null || exit 0
+      mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+    fi
+    /bin/sh -c 'printf "%s\n" "$PPID"' > "$LOCK_DIR/pid"
+    trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+    deactivate
+  )
+}
+
 plugin_state() {
   local output socket
   while IFS= read -r socket; do
@@ -210,17 +258,17 @@ plugin_state() {
 
 monitor() {
   local state
-  trap 'deactivate; rm -f "$MONITOR_PIDFILE"; exit 0' INT TERM HUP EXIT
+  trap 'deactivate_locked; rm -f "$MONITOR_PIDFILE"; exit 0' INT TERM HUP EXIT
   while :; do
     state="$(plugin_state)"
     case "$state" in
       enabled) reconcile ;;
-      disabled) deactivate ;;
+      disabled) deactivate_locked ;;
       missing) break ;;
     esac
     sleep "$POLL_INTERVAL"
   done
-  deactivate
+  deactivate_locked
   trap - EXIT
   rm -f "$MONITOR_PIDFILE"
 }
@@ -235,7 +283,7 @@ start() {
         && sudo -n /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; then
       rm -f "$STOP_FILE" "$OWNED_FILE"
     else
-      deactivate
+      deactivate_locked
       return
     fi
   fi
@@ -286,7 +334,7 @@ remove_helper() {
       sleep 0.1
     done
   fi
-  deactivate
+  deactivate_locked
   if [[ -f "$OWNED_FILE" ]]; then
     printf 'nosleep-herdr: normal sleep could not be restored; permission was not removed.\n' >&2
     printf 'Press Enter to close.\n'
@@ -314,5 +362,6 @@ case "${1:-}" in
   remove-helper) remove_helper ;;
   _monitor)     monitor ;;
   _lid-monitor) lid_monitor ;;
+  _caffeinate)  caffeinate_monitor ;;
   *) printf 'usage: plugin.sh <start|reconcile|status|remove-helper>\n' >&2; exit 1 ;;
 esac

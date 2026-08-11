@@ -480,7 +480,7 @@ cmd_status() {
   ds="$("$PMSET_BIN" -g | awk 'tolower($0) ~ /sleepdisabled|disablesleep/ {print $2; exit}')"
   ds="${ds:-0}"
   herdr_plugin_monitor_running && herdr_monitor=1
-  herdr_plugin_active && herdr_active=1
+  [[ "$ds" == "1" ]] && herdr_plugin_active && herdr_active=1
 
   if [[ "$ds" == "1" ]]; then
     if [[ "$herdr_active" == "1" ]]; then
@@ -518,10 +518,10 @@ cmd_status() {
     log "lid watcher  : not running"
   fi
 
-  if [[ "$herdr_active" == "1" ]]; then
+  if [[ "$ds" == "1" && "$herdr_active" == "1" ]]; then
     log "Herdr plugin : active (working agent detected)"
   elif [[ "$herdr_monitor" == "1" ]]; then
-    log "Herdr plugin : monitoring (no working agents)"
+    log "Herdr plugin : standby (no active no-sleep session)"
   fi
 
   if [[ "$ds" == "1" && -f "$OFF_AT_FILE" ]]; then
