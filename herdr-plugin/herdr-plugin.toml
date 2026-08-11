@@ -1,0 +1,44 @@
+id = "nosleep.agent-awake"
+name = "NoSleep for Agents"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Keep macOS awake while Herdr has live agents."
+platforms = ["macos"]
+
+[[build]]
+command = ["bash", "install.sh"]
+
+[[startup]]
+command = ["bash", "plugin.sh", "start"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bash", "plugin.sh", "reconcile"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "plugin.sh", "reconcile"]
+
+[[events]]
+on = "pane.exited"
+command = ["bash", "plugin.sh", "reconcile"]
+
+[[events]]
+on = "pane.closed"
+command = ["bash", "plugin.sh", "reconcile"]
+
+[[actions]]
+id = "status"
+title = "Show NoSleep status"
+command = ["bash", "plugin.sh", "status"]
+
+[[actions]]
+id = "start"
+title = "Start NoSleep monitoring"
+command = ["bash", "plugin.sh", "start"]
+
+[[panes]]
+id = "remove-helper"
+title = "Remove NoSleep system permission"
+placement = "popup"
+command = ["bash", "plugin.sh", "remove-helper"]
